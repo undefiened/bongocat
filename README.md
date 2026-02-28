@@ -1,6 +1,6 @@
 # Bongo cat app for Linux X11
 
-I vibecoded my own version of bongocat app which works for me on X11. This version is based on [https://github.com/kuroni/bongocat-osu](https://github.com/kuroni/bongocat-osu).
+I vibecoded my own version of bongocat app which works for me on X11. This version is based on [https://github.com/kuroni/bongocat-osu](https://github.com/kuroni/bongocat-osu), which is based on the original version by [HamishDuncanson](https://github.com/HamishDuncanson).
 
 ## Requirements
 
