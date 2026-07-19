@@ -4,6 +4,8 @@ import math
 import signal
 import argparse
 import threading
+import ctypes
+import select
 from abc import ABC, abstractmethod
 from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QAction
 from PyQt5.QtGui import QPainter, QPixmap, QColor, QPen, QPolygonF, QBrush, QIcon
@@ -15,6 +17,141 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class InputBackendError(RuntimeError):
     """Raised when a global input backend cannot be started."""
+
+
+LIBINPUT_OPEN = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p
+)
+LIBINPUT_CLOSE = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
+
+
+class LibinputInterface(ctypes.Structure):
+    _fields_ = [
+        ('open_restricted', LIBINPUT_OPEN),
+        ('close_restricted', LIBINPUT_CLOSE),
+    ]
+
+
+class LibinputPointerReader:
+    """Read compositor-style accelerated pointer deltas from libinput."""
+
+    POINTER_MOTION = 400
+
+    def __init__(self, device_paths, motion_callback):
+        self._motion_callback = motion_callback
+        self._running = True
+        self._lib = ctypes.CDLL('libinput.so.10', use_errno=True)
+
+        @LIBINPUT_OPEN
+        def open_restricted(path, flags, user_data):
+            try:
+                return os.open(path.decode(), flags)
+            except OSError as exc:
+                ctypes.set_errno(exc.errno)
+                return -exc.errno
+
+        @LIBINPUT_CLOSE
+        def close_restricted(fd, user_data):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+        self._open_restricted = open_restricted
+        self._close_restricted = close_restricted
+        self._interface = LibinputInterface(
+            self._open_restricted, self._close_restricted
+        )
+        self._configure_api()
+        self._context = self._lib.libinput_path_create_context(
+            ctypes.byref(self._interface), None
+        )
+        if not self._context:
+            raise InputBackendError('Cannot create libinput context')
+
+        self._libinput_devices = []
+        for path in device_paths:
+            device = self._lib.libinput_path_add_device(
+                self._context, os.fsencode(path)
+            )
+            if device:
+                self._libinput_devices.append(device)
+
+        if not self._libinput_devices:
+            self._lib.libinput_unref(self._context)
+            self._context = None
+            raise InputBackendError('Cannot open pointer devices with libinput')
+
+        self._fd = self._lib.libinput_get_fd(self._context)
+        self._thread = threading.Thread(
+            target=self._read_loop,
+            daemon=True,
+            name='libinput-pointer',
+        )
+        self._thread.start()
+
+    def _configure_api(self):
+        lib = self._lib
+        lib.libinput_path_create_context.argtypes = [
+            ctypes.POINTER(LibinputInterface), ctypes.c_void_p
+        ]
+        lib.libinput_path_create_context.restype = ctypes.c_void_p
+        lib.libinput_path_add_device.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p
+        ]
+        lib.libinput_path_add_device.restype = ctypes.c_void_p
+        lib.libinput_get_fd.argtypes = [ctypes.c_void_p]
+        lib.libinput_get_fd.restype = ctypes.c_int
+        lib.libinput_dispatch.argtypes = [ctypes.c_void_p]
+        lib.libinput_dispatch.restype = ctypes.c_int
+        lib.libinput_get_event.argtypes = [ctypes.c_void_p]
+        lib.libinput_get_event.restype = ctypes.c_void_p
+        lib.libinput_event_get_type.argtypes = [ctypes.c_void_p]
+        lib.libinput_event_get_type.restype = ctypes.c_int
+        lib.libinput_event_get_pointer_event.argtypes = [ctypes.c_void_p]
+        lib.libinput_event_get_pointer_event.restype = ctypes.c_void_p
+        lib.libinput_event_pointer_get_dx.argtypes = [ctypes.c_void_p]
+        lib.libinput_event_pointer_get_dx.restype = ctypes.c_double
+        lib.libinput_event_pointer_get_dy.argtypes = [ctypes.c_void_p]
+        lib.libinput_event_pointer_get_dy.restype = ctypes.c_double
+        lib.libinput_event_destroy.argtypes = [ctypes.c_void_p]
+        lib.libinput_unref.argtypes = [ctypes.c_void_p]
+        lib.libinput_unref.restype = ctypes.c_void_p
+
+    def _read_loop(self):
+        while self._running:
+            try:
+                ready, _, _ = select.select([self._fd], [], [], 0.25)
+            except (OSError, ValueError):
+                break
+            if not ready or self._lib.libinput_dispatch(self._context) != 0:
+                continue
+
+            while self._running:
+                event = self._lib.libinput_get_event(self._context)
+                if not event:
+                    break
+                try:
+                    if (
+                        self._lib.libinput_event_get_type(event)
+                        == self.POINTER_MOTION
+                    ):
+                        pointer = self._lib.libinput_event_get_pointer_event(
+                            event
+                        )
+                        self._motion_callback(
+                            self._lib.libinput_event_pointer_get_dx(pointer),
+                            self._lib.libinput_event_pointer_get_dy(pointer),
+                        )
+                finally:
+                    self._lib.libinput_event_destroy(event)
+
+    def cleanup(self):
+        self._running = False
+        self._thread.join(timeout=0.5)
+        if self._context is not None:
+            self._lib.libinput_unref(self._context)
+            self._context = None
 
 
 def is_wayland_session():
@@ -68,15 +205,36 @@ def make_x11_window_sticky(widget, xdisplay=None):
             xdisplay.close()
 
 
-def get_x11_pointer_position():
-    from Xlib import display
+def get_screen_bounds():
+    bounds = QApplication.primaryScreen().geometry()
+    for screen in QApplication.screens()[1:]:
+        bounds = bounds.united(screen.geometry())
+    return bounds
 
-    xdisplay = display.Display()
-    try:
-        data = xdisplay.screen().root.query_pointer()._data
-        return data['root_x'], data['root_y']
-    finally:
-        xdisplay.close()
+
+def get_x11_pointer_position(xdisplay, screen_bounds):
+    """Return X root pointer coordinates converted to Qt logical pixels."""
+    root = xdisplay.screen().root
+    root_geometry = root.get_geometry()
+    pointer = root.query_pointer()._data
+
+    def scale(value, source_size, target_start, target_size):
+        if source_size <= 1 or target_size <= 1:
+            return target_start
+        return target_start + round(
+            value * (target_size - 1) / (source_size - 1)
+        )
+
+    return (
+        scale(
+            pointer['root_x'], root_geometry.width,
+            screen_bounds.left(), screen_bounds.width(),
+        ),
+        scale(
+            pointer['root_y'], root_geometry.height,
+            screen_bounds.top(), screen_bounds.height(),
+        ),
+    )
 
 
 class InputBackend(ABC):
@@ -95,6 +253,11 @@ class InputBackend(ABC):
         """Make window visible on all workspaces."""
         pass
 
+    def is_pointer_over(self, widget):
+        """Return whether the global pointer is over the widget."""
+        x, y = self.get_mouse_position()
+        return widget.frameGeometry().contains(QPoint(x, y))
+
     def cleanup(self):
         """Release resources."""
         pass
@@ -105,7 +268,7 @@ class X11InputBackend(InputBackend):
         from Xlib import display
 
         self.display = display.Display()
-        self.root = self.display.screen().root
+        self._screen_bounds = get_screen_bounds()
 
     def get_pressed_keys(self):
         key_map = self.display.query_keymap()
@@ -118,8 +281,7 @@ class X11InputBackend(InputBackend):
         return pressed_keys
 
     def get_mouse_position(self):
-        data = self.root.query_pointer()._data
-        return data['root_x'], data['root_y']
+        return get_x11_pointer_position(self.display, self._screen_bounds)
 
     def make_sticky(self, widget):
         try:
@@ -140,25 +302,28 @@ class EvdevInputBackend(InputBackend):
         self._running = True
         self._threads = []
         self._devices = []
+        self._pointer_reader = None
+        self._pointer_source = 'raw'
+        self._pointer_fraction_x = 0.0
+        self._pointer_fraction_y = 0.0
 
-        screen_bounds = QApplication.primaryScreen().geometry()
-        for screen in QApplication.screens()[1:]:
-            screen_bounds = screen_bounds.united(screen.geometry())
-        self._screen_bounds = screen_bounds
-        self._mouse_x = screen_bounds.center().x()
-        self._mouse_y = screen_bounds.center().y()
+        self._screen_bounds = get_screen_bounds()
+        self._mouse_x = self._screen_bounds.center().x()
+        self._mouse_y = self._screen_bounds.center().y()
         if QApplication.platformName() == 'xcb':
+            from Xlib import display
+
+            xdisplay = display.Display()
             try:
-                self._mouse_x, self._mouse_y = get_x11_pointer_position()
-            except Exception as exc:
-                print(
-                    f"Warning: Cannot read initial pointer position: {exc}",
-                    file=sys.stderr,
+                self._mouse_x, self._mouse_y = get_x11_pointer_position(
+                    xdisplay, self._screen_bounds
                 )
+            finally:
+                xdisplay.close()
 
         denied_paths = []
         keyboard_count = 0
-        pointer_count = 0
+        pointer_specs = []
         for path in evdev.list_devices():
             try:
                 dev = evdev.InputDevice(path)
@@ -196,16 +361,21 @@ class EvdevInputBackend(InputBackend):
                 continue
 
             keyboard_count += int(is_keyboard)
-            pointer_count += int(pointer_mode is not None)
-            self._devices.append(dev)
-            t = threading.Thread(
-                target=self._read_device,
-                args=(dev, is_keyboard, pointer_mode),
-                daemon=True,
-                name=f"evdev-{os.path.basename(path)}",
-            )
-            t.start()
-            self._threads.append(t)
+            if pointer_mode is not None:
+                pointer_specs.append((path, pointer_mode))
+
+            if is_keyboard:
+                self._devices.append(dev)
+                t = threading.Thread(
+                    target=self._read_device,
+                    args=(dev, True, None),
+                    daemon=True,
+                    name=f"evdev-{os.path.basename(path)}",
+                )
+                t.start()
+                self._threads.append(t)
+            else:
+                dev.close()
 
         if keyboard_count == 0:
             self.cleanup()
@@ -215,11 +385,62 @@ class EvdevInputBackend(InputBackend):
                     "'input' group, then log out and back in. See README.md."
                 )
             raise InputBackendError("No keyboard input device found in /dev/input")
-        if pointer_count == 0:
+        if not pointer_specs:
             print(
                 "Warning: No pointer device found; mouse arm will stay still",
                 file=sys.stderr,
             )
+        else:
+            try:
+                self._pointer_reader = LibinputPointerReader(
+                    [path for path, _ in pointer_specs],
+                    self._handle_pointer_motion,
+                )
+                # Keep raw readers as a fallback until libinput emits its
+                # first processed motion event. Each open file descriptor gets
+                # its own event stream, so neither reader starves the other.
+                self._start_raw_pointer_readers(pointer_specs)
+            except (InputBackendError, OSError) as exc:
+                print(
+                    f"Warning: libinput unavailable ({exc}); using raw pointer "
+                    "motion",
+                    file=sys.stderr,
+                )
+                self._start_raw_pointer_readers(pointer_specs)
+
+    def _handle_pointer_motion(self, delta_x, delta_y):
+        with self._lock:
+            if self._pointer_source != 'libinput':
+                self._pointer_source = 'libinput'
+                self._pointer_fraction_x = 0.0
+                self._pointer_fraction_y = 0.0
+                print("Using libinput pointer motion")
+            total_x = delta_x + self._pointer_fraction_x
+            total_y = delta_y + self._pointer_fraction_y
+            move_x = int(total_x)
+            move_y = int(total_y)
+            self._pointer_fraction_x = total_x - move_x
+            self._pointer_fraction_y = total_y - move_y
+            self._move_pointer(move_x, move_y)
+
+    def _start_raw_pointer_readers(self, pointer_specs):
+        import evdev
+
+        for path, pointer_mode in pointer_specs:
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError as exc:
+                print(f"Warning: Cannot open {path}: {exc}", file=sys.stderr)
+                continue
+            self._devices.append(dev)
+            thread = threading.Thread(
+                target=self._read_device,
+                args=(dev, False, pointer_mode),
+                daemon=True,
+                name=f"evdev-{os.path.basename(path)}",
+            )
+            thread.start()
+            self._threads.append(thread)
 
     def _move_pointer(self, delta_x, delta_y):
         self._mouse_x = max(
@@ -248,8 +469,12 @@ class EvdevInputBackend(InputBackend):
             y_info = dev.absinfo(evdev.ecodes.ABS_Y)
             x_range = max(1, x_info.max - x_info.min)
             y_range = max(1, y_info.max - y_info.min)
-            x_scale = self._screen_bounds.width() / x_range
-            y_scale = self._screen_bounds.height() / y_range
+            # Raw touchpad coordinates move roughly twice as fast as GNOME's
+            # default libinput pointer motion. Match compositor movement so
+            # our virtual global cursor does not race toward screen edges.
+            touchpad_gain = 0.5
+            x_scale = self._screen_bounds.width() / x_range * touchpad_gain
+            y_scale = self._screen_bounds.height() / y_range * touchpad_gain
 
         try:
             for event in dev.read_loop():
@@ -264,6 +489,8 @@ class EvdevInputBackend(InputBackend):
                             self._pressed_keys.discard(key)
                 if pointer_mode == 'relative' and event.type == evdev.ecodes.EV_REL:
                     with self._lock:
+                        if self._pointer_source == 'libinput':
+                            continue
                         delta_x = 0
                         delta_y = 0
                         if event.code == evdev.ecodes.REL_X:
@@ -309,7 +536,8 @@ class EvdevInputBackend(InputBackend):
                             remainder_x = scaled_x - delta_x
                             remainder_y = scaled_y - delta_y
                             with self._lock:
-                                self._move_pointer(delta_x, delta_y)
+                                if self._pointer_source != 'libinput':
+                                    self._move_pointer(delta_x, delta_y)
                         last_absolute_x = absolute_x
                         last_absolute_y = absolute_y
         except OSError:
@@ -334,6 +562,9 @@ class EvdevInputBackend(InputBackend):
 
     def cleanup(self):
         self._running = False
+        if self._pointer_reader is not None:
+            self._pointer_reader.cleanup()
+            self._pointer_reader = None
         for dev in self._devices:
             try:
                 dev.close()
@@ -459,7 +690,7 @@ class BongoCat(QWidget):
 
         # Transparency logic — only update when changed to avoid
         # triggering compositor attention animations (GNOME orange border)
-        over_window = self.frameGeometry().contains(QPoint(root_x, root_y))
+        over_window = self.backend.is_pointer_over(self)
         new_opacity = 0.2 if over_window else 1.0
         if self.windowOpacity() != new_opacity:
             self.setWindowOpacity(new_opacity)
