@@ -6,8 +6,77 @@ import argparse
 import threading
 from abc import ABC, abstractmethod
 from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QAction
-from PyQt5.QtGui import QPainter, QPixmap, QColor, QPen, QPainterPath, QPolygonF, QBrush, QIcon
-from PyQt5.QtCore import Qt, QTimer, QPointF, QRect
+from PyQt5.QtGui import QPainter, QPixmap, QColor, QPen, QPolygonF, QBrush, QIcon
+from PyQt5.QtCore import Qt, QTimer, QPoint, QPointF
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+class InputBackendError(RuntimeError):
+    """Raised when a global input backend cannot be started."""
+
+
+def is_wayland_session():
+    return (
+        os.environ.get('XDG_SESSION_TYPE', '').lower() == 'wayland'
+        or bool(os.environ.get('WAYLAND_DISPLAY'))
+    )
+
+
+def configure_qt_platform():
+    """Use XWayland for the overlay unless the user selected a Qt platform.
+
+    Standard Wayland xdg-shell surfaces cannot choose an absolute position or
+    request always-on-top behavior.  XWayland provides those desktop-overlay
+    semantics on GNOME, KDE, and wlroots compositors without tying the app to a
+    compositor-specific protocol.
+    """
+    if (
+        is_wayland_session()
+        and os.environ.get('DISPLAY')
+        and not os.environ.get('QT_QPA_PLATFORM')
+    ):
+        os.environ['QT_QPA_PLATFORM'] = 'xcb'
+        print("Wayland session detected; using XWayland for overlay placement")
+
+
+def make_x11_window_sticky(widget, xdisplay=None):
+    from Xlib import display, X
+
+    owns_display = xdisplay is None
+    xdisplay = xdisplay or display.Display()
+    try:
+        window_id = int(widget.winId())
+        x11_window = xdisplay.create_resource_object('window', window_id)
+
+        desktop_atom = xdisplay.get_atom('_NET_WM_DESKTOP')
+        cardinal_atom = xdisplay.get_atom('CARDINAL')
+        x11_window.change_property(
+            desktop_atom, cardinal_atom, 32, [0xFFFFFFFF]
+        )
+
+        state_atom = xdisplay.get_atom('_NET_WM_STATE')
+        sticky_atom = xdisplay.get_atom('_NET_WM_STATE_STICKY')
+        atom_atom = xdisplay.get_atom('ATOM')
+        x11_window.change_property(
+            state_atom, atom_atom, 32, [sticky_atom], X.PropModeAppend
+        )
+        xdisplay.flush()
+    finally:
+        if owns_display:
+            xdisplay.close()
+
+
+def get_x11_pointer_position():
+    from Xlib import display
+
+    xdisplay = display.Display()
+    try:
+        data = xdisplay.screen().root.query_pointer()._data
+        return data['root_x'], data['root_y']
+    finally:
+        xdisplay.close()
 
 
 class InputBackend(ABC):
@@ -33,8 +102,8 @@ class InputBackend(ABC):
 
 class X11InputBackend(InputBackend):
     def __init__(self):
-        from Xlib import display, X
-        self._X = X
+        from Xlib import display
+
         self.display = display.Display()
         self.root = self.display.screen().root
 
@@ -54,19 +123,7 @@ class X11InputBackend(InputBackend):
 
     def make_sticky(self, widget):
         try:
-            window_id = int(widget.winId())
-            x11_window = self.display.create_resource_object('window', window_id)
-
-            desktop_atom = self.display.get_atom('_NET_WM_DESKTOP')
-            cardinal_atom = self.display.get_atom('CARDINAL')
-            x11_window.change_property(desktop_atom, cardinal_atom, 32, [0xFFFFFFFF])
-
-            state_atom = self.display.get_atom('_NET_WM_STATE')
-            sticky_atom = self.display.get_atom('_NET_WM_STATE_STICKY')
-            atom_atom = self.display.get_atom('ATOM')
-            x11_window.change_property(state_atom, atom_atom, 32, [sticky_atom], self._X.PropModeAppend)
-
-            self.display.flush()
+            make_x11_window_sticky(widget, self.display)
         except Exception as e:
             print(f"Warning: Failed to make window sticky: {e}")
 
@@ -77,104 +134,212 @@ class X11InputBackend(InputBackend):
 class EvdevInputBackend(InputBackend):
     def __init__(self):
         import evdev
+
         self._pressed_keys = set()
-        self._mouse_x = 0
-        self._mouse_y = 0
         self._lock = threading.Lock()
         self._running = True
         self._threads = []
-        self._keyboard_dev = None
-        self._mouse_dev = None
+        self._devices = []
 
-        # Get screen bounds for mouse clamping
-        screen = QApplication.primaryScreen().geometry()
-        self._screen_w = screen.width()
-        self._screen_h = screen.height()
-        self._mouse_x = self._screen_w // 2
-        self._mouse_y = self._screen_h // 2
+        screen_bounds = QApplication.primaryScreen().geometry()
+        for screen in QApplication.screens()[1:]:
+            screen_bounds = screen_bounds.united(screen.geometry())
+        self._screen_bounds = screen_bounds
+        self._mouse_x = screen_bounds.center().x()
+        self._mouse_y = screen_bounds.center().y()
+        if QApplication.platformName() == 'xcb':
+            try:
+                self._mouse_x, self._mouse_y = get_x11_pointer_position()
+            except Exception as exc:
+                print(
+                    f"Warning: Cannot read initial pointer position: {exc}",
+                    file=sys.stderr,
+                )
 
-        # Find devices
-        devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-        for dev in devices:
-            caps = dev.capabilities()
-            if self._keyboard_dev is None and evdev.ecodes.EV_KEY in caps:
-                # Check it has actual keyboard keys (not just mouse buttons)
-                key_caps = caps[evdev.ecodes.EV_KEY]
-                if evdev.ecodes.KEY_A in key_caps:
-                    self._keyboard_dev = dev
-                    continue
-            if self._mouse_dev is None and evdev.ecodes.EV_REL in caps:
-                self._mouse_dev = dev
+        denied_paths = []
+        keyboard_count = 0
+        pointer_count = 0
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+                caps = dev.capabilities()
+            except PermissionError:
+                denied_paths.append(path)
+                continue
+            except OSError as exc:
+                print(f"Warning: Cannot inspect {path}: {exc}", file=sys.stderr)
                 continue
 
-        if self._keyboard_dev is None:
-            print("Warning: No keyboard device found via evdev")
-        else:
-            t = threading.Thread(target=self._read_keyboard, daemon=True)
+            key_caps = caps.get(evdev.ecodes.EV_KEY, [])
+            rel_caps = caps.get(evdev.ecodes.EV_REL, [])
+            abs_caps = {
+                item[0] if isinstance(item, tuple) else item
+                for item in caps.get(evdev.ecodes.EV_ABS, [])
+            }
+            is_keyboard = evdev.ecodes.KEY_A in key_caps
+            is_relative_pointer = (
+                evdev.ecodes.REL_X in rel_caps
+                and evdev.ecodes.REL_Y in rel_caps
+            )
+            is_touchpad = (
+                evdev.ecodes.INPUT_PROP_POINTER in dev.input_props()
+                and evdev.ecodes.ABS_X in abs_caps
+                and evdev.ecodes.ABS_Y in abs_caps
+            )
+            pointer_mode = (
+                'relative' if is_relative_pointer
+                else 'touchpad' if is_touchpad
+                else None
+            )
+            if not is_keyboard and pointer_mode is None:
+                dev.close()
+                continue
+
+            keyboard_count += int(is_keyboard)
+            pointer_count += int(pointer_mode is not None)
+            self._devices.append(dev)
+            t = threading.Thread(
+                target=self._read_device,
+                args=(dev, is_keyboard, pointer_mode),
+                daemon=True,
+                name=f"evdev-{os.path.basename(path)}",
+            )
             t.start()
             self._threads.append(t)
 
-        if self._mouse_dev is None:
-            print("Warning: No mouse device found via evdev")
-        else:
-            t = threading.Thread(target=self._read_mouse, daemon=True)
-            t.start()
-            self._threads.append(t)
+        if keyboard_count == 0:
+            self.cleanup()
+            if denied_paths:
+                raise InputBackendError(
+                    "Cannot read keyboard input devices. Add your user to the "
+                    "'input' group, then log out and back in. See README.md."
+                )
+            raise InputBackendError("No keyboard input device found in /dev/input")
+        if pointer_count == 0:
+            print(
+                "Warning: No pointer device found; mouse arm will stay still",
+                file=sys.stderr,
+            )
 
-    def _read_keyboard(self):
+    def _move_pointer(self, delta_x, delta_y):
+        self._mouse_x = max(
+            self._screen_bounds.left(),
+            min(self._screen_bounds.right(), self._mouse_x + delta_x),
+        )
+        self._mouse_y = max(
+            self._screen_bounds.top(),
+            min(self._screen_bounds.bottom(), self._mouse_y + delta_y),
+        )
+
+    def _read_device(self, dev, is_keyboard, pointer_mode):
         import evdev
+
+        device_id = dev.path
+        touching = False
+        absolute_x = None
+        absolute_y = None
+        last_absolute_x = None
+        last_absolute_y = None
+        remainder_x = 0.0
+        remainder_y = 0.0
+
+        if pointer_mode == 'touchpad':
+            x_info = dev.absinfo(evdev.ecodes.ABS_X)
+            y_info = dev.absinfo(evdev.ecodes.ABS_Y)
+            x_range = max(1, x_info.max - x_info.min)
+            y_range = max(1, y_info.max - y_info.min)
+            x_scale = self._screen_bounds.width() / x_range
+            y_scale = self._screen_bounds.height() / y_range
+
         try:
-            for event in self._keyboard_dev.read_loop():
+            for event in dev.read_loop():
                 if not self._running:
                     break
-                if event.type == evdev.ecodes.EV_KEY:
+                if is_keyboard and event.type == evdev.ecodes.EV_KEY:
                     with self._lock:
-                        if event.value == 1:  # key down
-                            self._pressed_keys.add(event.code)
-                        elif event.value == 0:  # key up
-                            self._pressed_keys.discard(event.code)
-        except OSError:
-            pass
-
-    def _read_mouse(self):
-        import evdev
-        try:
-            for event in self._mouse_dev.read_loop():
-                if not self._running:
-                    break
-                if event.type == evdev.ecodes.EV_REL:
+                        key = (device_id, event.code)
+                        if event.value == 1:
+                            self._pressed_keys.add(key)
+                        elif event.value == 0:
+                            self._pressed_keys.discard(key)
+                if pointer_mode == 'relative' and event.type == evdev.ecodes.EV_REL:
                     with self._lock:
+                        delta_x = 0
+                        delta_y = 0
                         if event.code == evdev.ecodes.REL_X:
-                            self._mouse_x = max(0, min(self._screen_w, self._mouse_x + event.value))
+                            delta_x = event.value
                         elif event.code == evdev.ecodes.REL_Y:
-                            self._mouse_y = max(0, min(self._screen_h, self._mouse_y + event.value))
+                            delta_y = event.value
+                        self._move_pointer(delta_x, delta_y)
+                elif pointer_mode == 'touchpad':
+                    if (
+                        event.type == evdev.ecodes.EV_KEY
+                        and event.code == evdev.ecodes.BTN_TOUCH
+                    ):
+                        touching = bool(event.value)
+                        if not touching:
+                            last_absolute_x = None
+                            last_absolute_y = None
+                    elif event.type == evdev.ecodes.EV_ABS:
+                        if event.code == evdev.ecodes.ABS_X:
+                            absolute_x = event.value
+                        elif event.code == evdev.ecodes.ABS_Y:
+                            absolute_y = event.value
+                    elif (
+                        event.type == evdev.ecodes.EV_SYN
+                        and event.code == evdev.ecodes.SYN_REPORT
+                        and touching
+                        and absolute_x is not None
+                        and absolute_y is not None
+                    ):
+                        if (
+                            last_absolute_x is not None
+                            and last_absolute_y is not None
+                        ):
+                            scaled_x = (
+                                (absolute_x - last_absolute_x) * x_scale
+                                + remainder_x
+                            )
+                            scaled_y = (
+                                (absolute_y - last_absolute_y) * y_scale
+                                + remainder_y
+                            )
+                            delta_x = int(scaled_x)
+                            delta_y = int(scaled_y)
+                            remainder_x = scaled_x - delta_x
+                            remainder_y = scaled_y - delta_y
+                            with self._lock:
+                                self._move_pointer(delta_x, delta_y)
+                        last_absolute_x = absolute_x
+                        last_absolute_y = absolute_y
         except OSError:
             pass
+        finally:
+            with self._lock:
+                self._pressed_keys = {
+                    key for key in self._pressed_keys if key[0] != device_id
+                }
 
     def get_pressed_keys(self):
         with self._lock:
-            return list(self._pressed_keys)
+            return {key_code for _, key_code in self._pressed_keys}
 
     def get_mouse_position(self):
         with self._lock:
             return self._mouse_x, self._mouse_y
 
     def make_sticky(self, widget):
-        # No reliable way to do this on Wayland; no-op
-        pass
+        if QApplication.platformName() == 'xcb':
+            make_x11_window_sticky(widget)
 
     def cleanup(self):
         self._running = False
-        if self._keyboard_dev:
+        for dev in self._devices:
             try:
-                self._keyboard_dev.close()
+                dev.close()
             except Exception:
                 pass
-        if self._mouse_dev:
-            try:
-                self._mouse_dev.close()
-            except Exception:
-                pass
+        self._devices = []
 
 
 def detect_backend(override=None):
@@ -183,8 +348,7 @@ def detect_backend(override=None):
     if override == 'evdev':
         return EvdevInputBackend()
 
-    session_type = os.environ.get('XDG_SESSION_TYPE', '').lower()
-    if session_type == 'wayland' or os.environ.get('WAYLAND_DISPLAY'):
+    if is_wayland_session():
         print("Detected Wayland session, using evdev backend")
         return EvdevInputBackend()
     else:
@@ -207,7 +371,7 @@ class BongoCat(QWidget):
         self.OFFSET_Y = -50
 
         # Load images
-        self.img_dir = "img"
+        self.img_dir = os.path.join(APP_DIR, "img")
         self.bg = QPixmap(os.path.join(self.img_dir, "mousebg.png"))
         self.paws_up = QPixmap(os.path.join(self.img_dir, "up.png"))
         self.left_down = QPixmap(os.path.join(self.img_dir, "left.png"))
@@ -226,8 +390,8 @@ class BongoCat(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground)
         self.setGeometry(100, 100, self.w, self.h)
 
-        screen_geo = QApplication.primaryScreen().geometry()
-        self.move(screen_geo.width() - self.w - 50, screen_geo.height() - self.h - 50)
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        self.move(screen_geo.right() - self.w - 49, screen_geo.bottom() - self.h - 49)
 
         # Tray Icon Setup
         self.tray_icon = QSystemTrayIcon(self)
@@ -253,7 +417,7 @@ class BongoCat(QWidget):
 
         # State
         self.key_state = 0
-        self.last_key_pressed = None
+        self.pressed_keys = set()
         self.target_x = 258
         self.target_y = 228
         self.wrist_x = 258
@@ -282,36 +446,34 @@ class BongoCat(QWidget):
                 self.show()
 
     def update_state(self):
-        pressed_keys = self.backend.get_pressed_keys()
+        pressed_keys = set(self.backend.get_pressed_keys())
 
         if not pressed_keys:
             self.key_state = 0
-            self.last_key_pressed = None
         else:
-            current_key = pressed_keys[0]
-            if current_key != self.last_key_pressed:
+            if pressed_keys - self.pressed_keys:
                 self.key_state = 2 if self.key_state == 1 else 1
-                self.last_key_pressed = current_key
+        self.pressed_keys = pressed_keys
 
         root_x, root_y = self.backend.get_mouse_position()
 
         # Transparency logic — only update when changed to avoid
         # triggering compositor attention animations (GNOME orange border)
-        over_window = self.geometry().contains(root_x, root_y)
+        over_window = self.frameGeometry().contains(QPoint(root_x, root_y))
         new_opacity = 0.2 if over_window else 1.0
         if self.windowOpacity() != new_opacity:
             self.setWindowOpacity(new_opacity)
 
-        screen_geo = QApplication.primaryScreen().geometry()
-        fx = max(0.0, min(1.0, root_x / screen_geo.width()))
-        fy = max(0.0, min(1.0, root_y / screen_geo.height()))
+        screen = QApplication.screenAt(QPoint(root_x, root_y))
+        screen_geo = (screen or QApplication.primaryScreen()).geometry()
+        fx = max(0.0, min(1.0, (root_x - screen_geo.left()) / max(1, screen_geo.width() - 1)))
+        fy = max(0.0, min(1.0, (root_y - screen_geo.top()) / max(1, screen_geo.height() - 1)))
 
         self.target_x = -97 * fx + 44 * fy + 184
         self.target_y = -76 * fx - 40 * fy + 324
 
         self.calculate_arm()
         self.update()
-        self.raise_()
 
     def bezier(self, t, points):
         n = (len(points) // 2) - 1
@@ -448,8 +610,13 @@ if __name__ == "__main__":
                         help="Force input backend (default: auto-detect)")
     args = parser.parse_args()
 
+    configure_qt_platform()
     app = QApplication(sys.argv)
-    backend = detect_backend(args.backend)
+    try:
+        backend = detect_backend(args.backend)
+    except (InputBackendError, ImportError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     cat = BongoCat(backend)
     cat.show()
 
